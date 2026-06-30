@@ -5,12 +5,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPalette
 from PyQt6.QtWidgets import (
     QApplication,
-    QDialog,
-    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -33,6 +31,8 @@ from PyQt6.QtWidgets import (
 )
 
 PAGE_SIZE = 25
+MAX_COL_WIDTH = 280
+MIN_COL_WIDTH = 48
 
 # ── Neon palette ──────────────────────────────────────────────────────────────
 BG_DARK = "#0a0e17"
@@ -301,30 +301,79 @@ class FadeStack(QStackedWidget):
         self._anim_in.start()
 
 
-class RecordDialog(QDialog):
-    """Modal form for insert / update."""
+class RecordEditorPanel(QFrame):
+    """Inline scrollable form for insert / update (embedded in the data view)."""
 
-    def __init__(
+    saved = pyqtSignal()
+    cancelled = pyqtSignal()
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("card")
+        self.columns: list[str] = []
+        self.pk_columns: list[str] = []
+        self.edit_mode = False
+        self.fields: dict[str, QLineEdit] = {}
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 14, 16, 14)
+        outer.setSpacing(10)
+
+        self.title_label = QLabel("")
+        self.title_label.setFont(QFont("Segoe UI", 14, QFont.Weight.Bold))
+        self.title_label.setStyleSheet(f"color: {NEON_MAGENTA};")
+        outer.addWidget(self.title_label)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setMinimumHeight(120)
+        scroll.setMaximumHeight(320)
+
+        self._form_host = QWidget()
+        self._form_layout = QFormLayout(self._form_host)
+        self._form_layout.setSpacing(10)
+        self._form_layout.setContentsMargins(4, 4, 12, 4)
+        scroll.setWidget(self._form_host)
+        outer.addWidget(scroll, stretch=1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        save_btn = AnimatedButton("Сохранить")
+        save_btn.setObjectName("success")
+        save_btn.clicked.connect(self.saved.emit)
+        cancel_btn = AnimatedButton("Отмена")
+        cancel_btn.setObjectName("ghost")
+        cancel_btn.clicked.connect(self.cancelled.emit)
+        buttons.addWidget(cancel_btn)
+        buttons.addWidget(save_btn)
+        outer.addLayout(buttons)
+
+        self.hide()
+
+    def _clear_fields(self) -> None:
+        while self._form_layout.count():
+            item = self._form_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        self.fields.clear()
+
+    def open_form(
         self,
         columns: list[str],
         pk_columns: list[str],
         values: dict[str, Any] | None = None,
         edit_mode: bool = False,
-        parent: QWidget | None = None,
     ) -> None:
-        super().__init__(parent)
         self.columns = columns
         self.pk_columns = pk_columns
         self.edit_mode = edit_mode
-        self.fields: dict[str, QLineEdit] = {}
+        self._clear_fields()
 
-        self.setWindowTitle("Редактировать запись" if edit_mode else "Новая запись")
-        self.setMinimumWidth(420)
-        self.setStyleSheet(neon_stylesheet())
-
-        layout = QVBoxLayout(self)
-        form = QFormLayout()
-        form.setSpacing(12)
+        self.title_label.setText(
+            "Редактировать запись" if edit_mode else "Новая запись"
+        )
 
         for col in columns:
             field = QLineEdit()
@@ -334,16 +383,13 @@ class RecordDialog(QDialog):
             if values and col in values and values[col] is not None:
                 field.setText(str(values[col]))
             self.fields[col] = field
-            form.addRow(col, field)
+            self._form_layout.addRow(col, field)
 
-        layout.addLayout(form)
+        self.show()
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+    def close_form(self) -> None:
+        self.hide()
+        self._clear_fields()
 
     def get_values(self) -> dict[str, str]:
         return {col: field.text() for col, field in self.fields.items()}
@@ -466,7 +512,7 @@ class DatabaseBrowser(QMainWindow):
         nav = QHBoxLayout()
         back_btn = AnimatedButton("← Назад")
         back_btn.setObjectName("ghost")
-        back_btn.clicked.connect(lambda: self.stack.setCurrentIndexAnimated(0))
+        back_btn.clicked.connect(self._go_back_to_tables)
 
         self.table_title = QLabel("")
         self.table_title.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
@@ -503,12 +549,23 @@ class DatabaseBrowser(QMainWindow):
         crud.addWidget(refresh_btn)
         layout.addLayout(crud)
 
+        self.record_panel = RecordEditorPanel()
+        self.record_panel.saved.connect(self._save_record_panel)
+        self.record_panel.cancelled.connect(self.record_panel.close_form)
+        layout.addWidget(self.record_panel)
+
         self.data_table = QTableWidget()
         self.data_table.setAlternatingRowColors(True)
         self.data_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.data_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         self.data_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.data_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.data_table.setWordWrap(True)
+        self.data_table.setHorizontalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
+        self.data_table.setVerticalScrollMode(QTableWidget.ScrollMode.ScrollPerPixel)
+        header = self.data_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        header.setStretchLastSection(False)
+        header.setMinimumSectionSize(MIN_COL_WIDTH)
         self.data_table.verticalHeader().setVisible(False)
         layout.addWidget(self.data_table)
 
@@ -537,6 +594,10 @@ class DatabaseBrowser(QMainWindow):
         layout.addLayout(pag)
 
         return page
+
+    def _go_back_to_tables(self) -> None:
+        self.record_panel.close_form()
+        self.stack.setCurrentIndexAnimated(0)
 
     def _show_empty_state(self) -> None:
         self._clear_layout(self.tables_layout)
@@ -628,6 +689,7 @@ class DatabaseBrowser(QMainWindow):
 
         self.current_table = table_name
         self.current_page = 0
+        self.record_panel.close_form()
 
         info = self.conn.execute(f'PRAGMA table_info("{table_name}")').fetchall()
         self.columns = [r["name"] for r in info]
@@ -663,9 +725,13 @@ class DatabaseBrowser(QMainWindow):
         for r_idx, row in enumerate(rows):
             for c_idx, col in enumerate(self.columns):
                 val = row[col]
-                item = QTableWidgetItem("" if val is None else str(val))
+                text = "" if val is None else str(val)
+                item = QTableWidgetItem(text)
                 item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                item.setToolTip(text)
                 self.data_table.setItem(r_idx, c_idx, item)
+
+        self._fit_table_columns()
 
         start = offset + 1 if self.total_rows else 0
         end = min(offset + PAGE_SIZE, self.total_rows)
@@ -680,6 +746,22 @@ class DatabaseBrowser(QMainWindow):
 
         self.prev_btn.setEnabled(self.current_page > 0)
         self.next_btn.setEnabled(self.current_page < total_pages - 1)
+
+    def _fit_table_columns(self) -> None:
+        """Size columns to content with compact min/max bounds."""
+        header = self.data_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.data_table.resizeColumnsToContents()
+
+        for col in range(len(self.columns)):
+            width = header.sectionSize(col)
+            if width > MAX_COL_WIDTH:
+                header.resizeSection(col, MAX_COL_WIDTH)
+            elif width < MIN_COL_WIDTH:
+                header.resizeSection(col, MIN_COL_WIDTH)
+
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.data_table.resizeRowsToContents()
 
     def prev_page(self) -> None:
         if self.current_page > 0:
@@ -709,22 +791,7 @@ class DatabaseBrowser(QMainWindow):
         if not self.conn or not self.current_table:
             return
 
-        dlg = RecordDialog(self.columns, self.pk_columns, parent=self)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        values = dlg.get_values()
-        placeholders = ", ".join("?" for _ in self.columns)
-        col_names = ", ".join(f'"{c}"' for c in self.columns)
-        sql = f'INSERT INTO "{self.current_table}" ({col_names}) VALUES ({placeholders})'
-
-        try:
-            self.conn.execute(sql, [values[c] for c in self.columns])
-            self.conn.commit()
-            self.refresh_table()
-            self.load_tables()
-        except sqlite3.Error as exc:
-            QMessageBox.warning(self, "Ошибка", f"Не удалось добавить запись:\n{exc}")
+        self.record_panel.open_form(self.columns, self.pk_columns)
 
     def edit_record(self) -> None:
         if not self.conn or not self.current_table:
@@ -735,17 +802,48 @@ class DatabaseBrowser(QMainWindow):
             QMessageBox.information(self, "Выбор", "Выберите строку для редактирования.")
             return
 
-        dlg = RecordDialog(
+        self.record_panel.open_form(
             self.columns,
             self.pk_columns,
             values=current,
             edit_mode=True,
-            parent=self,
         )
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+
+    def _save_record_panel(self) -> None:
+        if not self.conn or not self.current_table:
             return
 
-        new_values = dlg.get_values()
+        panel = self.record_panel
+        if panel.edit_mode:
+            self._commit_edit(panel)
+        else:
+            self._commit_insert(panel)
+
+    def _commit_insert(self, panel: RecordEditorPanel) -> None:
+        values = panel.get_values()
+        placeholders = ", ".join("?" for _ in self.columns)
+        col_names = ", ".join(f'"{c}"' for c in self.columns)
+        sql = f'INSERT INTO "{self.current_table}" ({col_names}) VALUES ({placeholders})'
+
+        try:
+            self.conn.execute(sql, [values[c] for c in self.columns])
+            self.conn.commit()
+            panel.close_form()
+            self.refresh_table()
+            self.load_tables()
+        except sqlite3.Error as exc:
+            QMessageBox.warning(self, "Ошибка", f"Не удалось добавить запись:\n{exc}")
+
+    def _commit_edit(self, panel: RecordEditorPanel) -> None:
+        row_idx = self.data_table.currentRow()
+        if row_idx < 0:
+            return
+
+        current = {
+            self.columns[c]: self.data_table.item(row_idx, c).text()
+            for c in range(len(self.columns))
+        }
+
         if not self.pk_columns:
             QMessageBox.warning(
                 self,
@@ -754,6 +852,7 @@ class DatabaseBrowser(QMainWindow):
             )
             return
 
+        new_values = panel.get_values()
         set_clause = ", ".join(f'"{c}" = ?' for c in self.columns if c not in self.pk_columns)
         where_clause = " AND ".join(f'"{c}" = ?' for c in self.pk_columns)
         params = [new_values[c] for c in self.columns if c not in self.pk_columns]
@@ -764,6 +863,7 @@ class DatabaseBrowser(QMainWindow):
         try:
             self.conn.execute(sql, params)
             self.conn.commit()
+            panel.close_form()
             self.refresh_table()
         except sqlite3.Error as exc:
             QMessageBox.warning(self, "Ошибка", f"Не удалось обновить запись:\n{exc}")
@@ -864,7 +964,7 @@ def main() -> None:
         if db_arg.exists():
             QTimer.singleShot(100, lambda: _auto_open(window, db_arg))
 
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())
 
 
